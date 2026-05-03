@@ -1,5 +1,8 @@
+from raft.client import RaftClient
+
+
 def main() -> None:
-    print("Hello from sd-pyro!")
+    RaftClient().run()
 
 
 if __name__ == "__main__":
