@@ -44,12 +44,12 @@ class RaftNode:
         self.voted_for: str | None = None
         self.log: list[LogEntry] = []
 
-        # Volatile state
+        # state
         self.role: NodeRole = NodeRole.FOLLOWER
         self.commit_index: int = 0
         self.last_applied: int = 0
 
-        # Leader volatile state — reinitialized on each election win
+        # Leader state — reinitialized on each election win
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
 
@@ -128,7 +128,6 @@ class RaftNode:
             return False
 
     def _has_quorum(self) -> bool:
-        """True when enough peers are reachable to form a majority."""
         majority = (len(self.peers) + 1) // 2 + 1
         needed = majority - 1  # self counts as one vote
         reachable = sum(1 for p in self.peers if self._is_peer_reachable(p))
@@ -188,48 +187,62 @@ class RaftNode:
         self, term: int, last_log_index: int, last_log_term: int
     ) -> tuple[int, int]:
         """Return ``(granted_votes, responded_peers)``."""
-
-        def request_from(peer: NodeConfig) -> tuple[bool, bool]:
-            """Return ``(vote_granted, peer_responded)``."""
-            try:
-                with Pyro5.api.Proxy(peer.uri) as remote:
-                    request: VoteRequestWire = {
-                        "term": term,
-                        "candidate_id": self.node_id,
-                        "last_log_index": last_log_index,
-                        "last_log_term": last_log_term,
-                    }
-                    result = cast(VoteReplyWire, remote.request_vote(request))
-                    if result["term"] > term:
-                        with self._lock:
-                            if result["term"] > self.current_term:
-                                self.current_term = result["term"]
-                                self.role = NodeRole.FOLLOWER
-                                self.voted_for = None
-                                self._commit_condition.notify_all()
-                        return False, True
-                    granted = result["vote_granted"]
-                    self._logger.debug(
-                        "term=%d  vote %s  from %s",
-                        term,
-                        "GRANTED" if granted else "DENIED",
-                        peer.node_id,
-                    )
-                    return granted, True
-            except Exception as exc:
-                self._logger.debug(
-                    "term=%d  %s unreachable: %s", term, peer.node_id, exc
-                )
-                return False, False
-
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            results = list(executor.map(request_from, self.peers))
+            futures = [
+                executor.submit(
+                    self._request_vote_from,
+                    peer,
+                    term,
+                    last_log_index,
+                    last_log_term,
+                )
+                for peer in self.peers
+            ]
+            results = [f.result() for f in futures]
         granted = sum(1 for v, _ in results if v)
         responded = sum(1 for _, r in results if r)
         return granted, responded
 
+    def _request_vote_from(
+        self,
+        peer: NodeConfig,
+        term: int,
+        last_log_index: int,
+        last_log_term: int,
+    ) -> tuple[bool, bool]:
+        """Ask *peer* for a vote. Returns ``(vote_granted, peer_responded)``."""
+        try:
+            with Pyro5.api.Proxy(peer.uri) as remote:
+                request: VoteRequestWire = {
+                    "term": term,
+                    "candidate_id": self.node_id,
+                    "last_log_index": last_log_index,
+                    "last_log_term": last_log_term,
+                }
+                result = cast(VoteReplyWire, remote.request_vote(request))
+                if result["term"] > term:
+                    with self._lock:
+                        if result["term"] > self.current_term:
+                            self.current_term = result["term"]
+                            self.role = NodeRole.FOLLOWER
+                            self.voted_for = None
+                            self._commit_condition.notify_all()
+                    return False, True
+                granted = result["vote_granted"]
+                self._logger.debug(
+                    "term=%d  vote %s  from %s",
+                    term,
+                    "GRANTED" if granted else "DENIED",
+                    peer.node_id,
+                )
+                return granted, True
+        except Exception as exc:
+            self._logger.debug(
+                "term=%d  %s unreachable: %s", term, peer.node_id, exc
+            )
+            return False, False
+
     def _become_leader(self) -> None:
-        """Must be called while holding self._lock."""
         self.role = NodeRole.LEADER
         next_idx = len(self.log) + 1
         self.next_index = {p.node_id: next_idx for p in self.peers}
@@ -254,10 +267,6 @@ class RaftNode:
             self._logger.warning("failed to register as leader: %s", exc)
 
     def _advance_commit_index(self) -> None:
-        """Commit entries replicated by a majority.
-
-        Must be called while holding self._lock.
-        """
         majority = (len(self.peers) + 1) // 2 + 1
         for n in range(len(self.log), self.commit_index, -1):
             if self.log[n - 1].term != self.current_term:
@@ -292,73 +301,83 @@ class RaftNode:
                 return
             term = self.current_term
             leader_commit = self.commit_index
-            # Snapshot per-peer send parameters while holding the lock
-            peer_params: dict[str, tuple[int, int, list[LogEntry]]] = {}
+            sends: list[tuple[NodeConfig, int, int, list[LogEntry]]] = []
             for peer in self.peers:
                 ni = self.next_index.get(peer.node_id, len(self.log) + 1)
                 prev_idx = ni - 1
                 prev_term = self.log[prev_idx - 1].term if prev_idx > 0 else 0
-                peer_params[peer.node_id] = (
-                    prev_idx,
-                    prev_term,
-                    list(self.log[ni - 1 :]),
+                sends.append(
+                    (peer, prev_idx, prev_term, list(self.log[ni - 1 :]))
                 )
 
-        def send_to(peer: NodeConfig) -> None:
-            prev_idx, prev_term, entries = peer_params[peer.node_id]
-            try:
-                with Pyro5.api.Proxy(peer.uri) as remote:
-                    payload: AppendEntriesWire = {
-                        "term": term,
-                        "leader_id": self.node_id,
-                        "prev_log_index": prev_idx,
-                        "prev_log_term": prev_term,
-                        "entries": [
-                            LogEntryWire(
-                                term=e.term, index=e.index, command=e.command
-                            )
-                            for e in entries
-                        ],
-                        "leader_commit": leader_commit,
-                    }
-                    result = cast(
-                        AppendReplyWire, remote.append_entries(payload)
-                    )
-                    with self._lock:
-                        if result["term"] > self.current_term:
-                            self._logger.info(
-                                "term=%d  FOLLOWER  higher term=%d from %s",
-                                self.current_term,
-                                result["term"],
-                                peer.node_id,
-                            )
-                            self.current_term = result["term"]
-                            self.role = NodeRole.FOLLOWER
-                            self.voted_for = None
-                            self._commit_condition.notify_all()
-                            return
-                        if (
-                            self.role != NodeRole.LEADER
-                            or self.current_term != term
-                        ):
-                            return  # stale response
-                        if result["success"]:
-                            new_match = result["match_index"]
-                            self.match_index[peer.node_id] = max(
-                                self.match_index.get(peer.node_id, 0), new_match
-                            )
-                            self.next_index[peer.node_id] = new_match + 1
-                            self._advance_commit_index()
-                        else:
-                            self.next_index[peer.node_id] = max(
-                                1, self.next_index.get(peer.node_id, 1) - 1
-                            )
-            except Exception:
-                pass
-
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            for peer in self.peers:
-                executor.submit(send_to, peer)
+            for peer, prev_idx, prev_term, entries in sends:
+                executor.submit(
+                    self._send_append_entries,
+                    peer,
+                    term,
+                    leader_commit,
+                    prev_idx,
+                    prev_term,
+                    entries,
+                )
+
+    def _send_append_entries(
+        self,
+        peer: NodeConfig,
+        term: int,
+        leader_commit: int,
+        prev_idx: int,
+        prev_term: int,
+        entries: list[LogEntry],
+    ) -> None:
+        try:
+            with Pyro5.api.Proxy(peer.uri) as remote:
+                payload: AppendEntriesWire = {
+                    "term": term,
+                    "leader_id": self.node_id,
+                    "prev_log_index": prev_idx,
+                    "prev_log_term": prev_term,
+                    "entries": [
+                        LogEntryWire(
+                            term=e.term, index=e.index, command=e.command
+                        )
+                        for e in entries
+                    ],
+                    "leader_commit": leader_commit,
+                }
+                result = cast(AppendReplyWire, remote.append_entries(payload))
+                with self._lock:
+                    if result["term"] > self.current_term:
+                        self._logger.info(
+                            "term=%d  FOLLOWER  higher term=%d from %s",
+                            self.current_term,
+                            result["term"],
+                            peer.node_id,
+                        )
+                        self.current_term = result["term"]
+                        self.role = NodeRole.FOLLOWER
+                        self.voted_for = None
+                        self._commit_condition.notify_all()
+                        return
+                    if (
+                        self.role != NodeRole.LEADER
+                        or self.current_term != term
+                    ):
+                        return  # stale response
+                    if result["success"]:
+                        new_match = result["match_index"]
+                        self.match_index[peer.node_id] = max(
+                            self.match_index.get(peer.node_id, 0), new_match
+                        )
+                        self.next_index[peer.node_id] = new_match + 1
+                        self._advance_commit_index()
+                    else:
+                        self.next_index[peer.node_id] = max(
+                            1, self.next_index.get(peer.node_id, 1) - 1
+                        )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # RPC handlers                                                         #
@@ -428,7 +447,6 @@ class RaftNode:
 
             self._reset_election_timer()
 
-            # Log consistency check
             if req.prev_log_index > 0:
                 if len(self.log) < req.prev_log_index:
                     return AppendReply(
@@ -452,11 +470,9 @@ class RaftNode:
                 log_idx = req.prev_log_index + i  # 0-based position in self.log
                 if log_idx < len(self.log):
                     if self.log[log_idx].term != entry.term:
-                        # Conflict: truncate and append remaining
                         self.log = self.log[:log_idx]
                         self.log.extend(req.entries[i:])
                         break
-                    # Matching entry already present — skip
                 else:
                     self.log.extend(req.entries[i:])
                     break
@@ -503,8 +519,6 @@ class RaftNode:
 
 @Pyro5.api.expose
 class RaftNodeRPC:
-    """Thin Pyro5 RPC adapter — only these methods are remotely accessible."""
-
     def __init__(self, node: RaftNode) -> None:
         self._node = node
 
