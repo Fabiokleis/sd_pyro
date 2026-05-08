@@ -45,7 +45,7 @@ class TestFindLeader:
     def test_converts_lookup_result_to_str(self) -> None:
         """lookup() may return a URI object; _find_leader must return str."""
         ns = MagicMock()
-        ns.lookup.return_value = object()  # not a str
+        ns.lookup.return_value = object()
         with patch("Pyro5.api.locate_ns", return_value=ns):
             result = RaftClient()._find_leader()
         assert isinstance(result, str)
@@ -58,86 +58,55 @@ class TestFindLeader:
 
 class TestSendCommand:
     def test_returns_true_on_committed(self) -> None:
-        client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
-        with patch("Pyro5.api.Proxy", return_value=_make_proxy(True)):
-            assert client.send_command("set x 1") is True
-
-    def test_returns_false_when_commit_fails(self) -> None:
-        client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
-        with (
-            patch("Pyro5.api.Proxy", return_value=_make_proxy(False)),
-            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
-            patch("raft.client.time.sleep"),
-        ):
-            assert client.send_command("set x 1") is False
-
-    def test_returns_false_when_no_leader_found(self) -> None:
-        client = RaftClient()
-        with (
-            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
-            patch("raft.client.time.sleep"),
-        ):
-            assert client.send_command("set x 1") is False
-
-    def test_looks_up_leader_when_uri_is_none(self) -> None:
-        client = RaftClient()
-        ns = _make_ns("PYRO:node2@localhost:9002")
+        ns = _make_ns("PYRO:node1@localhost:9001")
         with (
             patch("Pyro5.api.locate_ns", return_value=ns),
             patch("Pyro5.api.Proxy", return_value=_make_proxy(True)),
         ):
-            client.send_command("set x 1")
-        assert client._leader_uri == "PYRO:node2@localhost:9002"
+            assert RaftClient().send_command("set x 1") is True
 
-    def test_clears_leader_uri_on_proxy_error(self) -> None:
+    def test_returns_false_when_commit_fails(self) -> None:
+        ns = _make_ns("PYRO:node1@localhost:9001")
+        with (
+            patch("Pyro5.api.locate_ns", return_value=ns),
+            patch("Pyro5.api.Proxy", return_value=_make_proxy(False)),
+        ):
+            assert RaftClient().send_command("set x 1") is False
+
+    def test_returns_false_when_no_leader_found(self) -> None:
+        with patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")):
+            assert RaftClient().send_command("set x 1") is False
+
+    def test_always_looks_up_leader_in_ns(self) -> None:
+        """Every send_command call must query the name server."""
+        ns = _make_ns("PYRO:node1@localhost:9001")
         client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
+        with (
+            patch("Pyro5.api.locate_ns", return_value=ns) as mock_ns,
+            patch("Pyro5.api.Proxy", return_value=_make_proxy(True)),
+        ):
+            client.send_command("cmd1")
+            client.send_command("cmd2")
+        assert mock_ns.call_count == 2
+
+    def test_returns_false_on_proxy_error(self) -> None:
+        ns = _make_ns("PYRO:node1@localhost:9001")
         proxy = _make_proxy()
         proxy.__enter__.side_effect = Exception("connection refused")
         with (
-            patch("Pyro5.api.Proxy", return_value=proxy),
-            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
-            patch("raft.client.time.sleep"),
-        ):
-            result = client.send_command("set x 1")
-        assert result is False
-        assert client._leader_uri is None
-
-    def test_clears_leader_uri_when_node_not_leader(self) -> None:
-        """False return (not leader) must also clear the cached URI."""
-        client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
-        with (
-            patch("Pyro5.api.Proxy", return_value=_make_proxy(False)),
-            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
-            patch("raft.client.time.sleep"),
-        ):
-            client.send_command("set x 1")
-        assert client._leader_uri is None
-
-    def test_retries_and_succeeds_after_leader_change(self) -> None:
-        """First attempt fails (not leader); second finds new leader."""
-        client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
-        dead_proxy = _make_proxy(False)
-        new_proxy = _make_proxy(True)
-        ns = _make_ns("PYRO:node2@localhost:9002")
-        proxies = iter([dead_proxy, new_proxy])
-        with (
-            patch("Pyro5.api.Proxy", side_effect=lambda _uri: next(proxies)),
             patch("Pyro5.api.locate_ns", return_value=ns),
-            patch("raft.client.time.sleep"),
+            patch("Pyro5.api.Proxy", return_value=proxy),
         ):
-            assert client.send_command("set x 1") is True
+            assert RaftClient().send_command("set x 1") is False
 
     def test_forwards_command_string_verbatim(self) -> None:
-        client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
+        ns = _make_ns("PYRO:node1@localhost:9001")
         proxy = _make_proxy(True)
-        with patch("Pyro5.api.Proxy", return_value=proxy):
-            client.send_command("delete key_abc")
+        with (
+            patch("Pyro5.api.locate_ns", return_value=ns),
+            patch("Pyro5.api.Proxy", return_value=proxy),
+        ):
+            RaftClient().send_command("delete key_abc")
         proxy.submit_command.assert_called_once_with("delete key_abc")
 
 
@@ -153,7 +122,7 @@ class TestRun:
             patch("raft.client.Prompt.ask", side_effect=["quit"]),
             patch.object(client._console, "print"),
         ):
-            client.run()  # must return without error
+            client.run()
 
     def test_exits_on_exit_alias(self) -> None:
         client = RaftClient()
@@ -169,7 +138,7 @@ class TestRun:
             patch("raft.client.Prompt.ask", side_effect=KeyboardInterrupt),
             patch.object(client._console, "print"),
         ):
-            client.run()  # must not propagate KeyboardInterrupt
+            client.run()
 
     def test_exits_on_eof(self) -> None:
         client = RaftClient()
@@ -185,7 +154,7 @@ class TestRun:
             patch("raft.client.Prompt.ask", side_effect=["", "   ", "quit"]),
             patch.object(client._console, "print"),
         ):
-            client.run()  # must not crash or submit empty commands
+            client.run()
 
     def test_status_shows_leader_uri(self) -> None:
         client = RaftClient()
@@ -216,14 +185,15 @@ class TestRun:
             patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
             patch.object(client._console, "print"),
         ):
-            client.run()  # must not raise
+            client.run()
 
     def test_submits_user_command(self) -> None:
         client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
+        ns = _make_ns("PYRO:node1@localhost:9001")
         proxy = _make_proxy(True)
         with (
             patch("raft.client.Prompt.ask", side_effect=["set x 42", "quit"]),
+            patch("Pyro5.api.locate_ns", return_value=ns),
             patch("Pyro5.api.Proxy", return_value=proxy),
             patch.object(client._console, "print"),
         ):
@@ -232,11 +202,12 @@ class TestRun:
 
     def test_shows_success_message_on_commit(self) -> None:
         client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
+        ns = _make_ns("PYRO:node1@localhost:9001")
         proxy = _make_proxy(True)
         printed: list[str] = []
         with (
             patch("raft.client.Prompt.ask", side_effect=["set x 1", "quit"]),
+            patch("Pyro5.api.locate_ns", return_value=ns),
             patch("Pyro5.api.Proxy", return_value=proxy),
             patch.object(
                 client._console,
@@ -249,14 +220,13 @@ class TestRun:
 
     def test_shows_failure_message_on_no_commit(self) -> None:
         client = RaftClient()
-        client._leader_uri = "PYRO:node1@localhost:9001"
+        ns = _make_ns("PYRO:node1@localhost:9001")
         proxy = _make_proxy(False)
         printed: list[str] = []
         with (
             patch("raft.client.Prompt.ask", side_effect=["set x 1", "quit"]),
+            patch("Pyro5.api.locate_ns", return_value=ns),
             patch("Pyro5.api.Proxy", return_value=proxy),
-            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
-            patch("raft.client.time.sleep"),
             patch.object(
                 client._console,
                 "print",
@@ -284,5 +254,4 @@ class TestRun:
             client.run()
         assert len(tables) == 1
         assert tables[0].title == "Available Commands"
-        # help, status, quit/exit, <any text>
         assert len(tables[0].rows) == 4

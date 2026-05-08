@@ -1,7 +1,6 @@
 import concurrent.futures
 import logging
 import random
-import socket
 import threading
 from typing import cast
 
@@ -121,9 +120,11 @@ class RaftNode:
 
     def _is_peer_reachable(self, peer: NodeConfig) -> bool:
         try:
-            with socket.create_connection((peer.host, peer.port), timeout=0.05):
+            with Pyro5.api.Proxy(peer.uri) as remote:
+                remote._pyroTimeout = 0.1
+                remote.ping()
                 return True
-        except OSError:
+        except Exception:
             return False
 
     def _has_quorum(self) -> bool:
@@ -539,3 +540,6 @@ class RaftNodeRPC:
 
     def submit_command(self, command: str) -> bool:
         return self._node.submit_command(command)
+
+    def ping(self) -> bool:
+        return True

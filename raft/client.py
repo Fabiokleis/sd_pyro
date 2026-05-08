@@ -1,5 +1,3 @@
-import time
-
 import Pyro5.api
 from rich.console import Console
 from rich.panel import Panel
@@ -7,20 +5,15 @@ from rich.prompt import Prompt
 
 from raft.config import LEADER_NAME, NAMESERVER_HOST, NAMESERVER_PORT
 
-_MAX_RETRIES = 3
-_RETRY_DELAY = 0.5  # seconds between retries after leader change
-
 
 class RaftClient:
     """Interactive Raft cluster client.
 
-    Looks up the current leader in the Pyro5 name server, then forwards
-    user commands via ``submit_command``.  Automatically re-looks up the
-    leader URI whenever a connection attempt fails.
+    Looks up the current leader in the Pyro5 name server before every
+    command, so the URI is always fresh.
     """
 
     def __init__(self) -> None:
-        self._leader_uri: str | None = None
         self._console = Console()
 
     # ------------------------------------------------------------------
@@ -41,38 +34,18 @@ class RaftClient:
     # ------------------------------------------------------------------
 
     def send_command(self, command: str) -> bool:
-        """Submit *command* to the leader and return True if committed.
+        """Look up the leader and submit *command*.
 
-        Retries up to ``_MAX_RETRIES`` times to handle leader changes — on
-        each failure (connection error or node not leader) the cached leader
-        URI is cleared so the name server is re-queried on the next attempt.
+        Returns True if the command was committed.
         """
-        for attempt in range(_MAX_RETRIES):
-            if attempt > 0:
-                self._console.print(
-                    f"[yellow]Leader may have changed, retrying"
-                    f" ({attempt}/{_MAX_RETRIES - 1})…[/yellow]"
-                )
-                time.sleep(_RETRY_DELAY)
-                self._leader_uri = None
-
-            if self._leader_uri is None:
-                self._leader_uri = self._find_leader()
-            if self._leader_uri is None:
-                continue
-
-            try:
-                with Pyro5.api.Proxy(self._leader_uri) as proxy:
-                    ok = bool(proxy.submit_command(command))
-                    if ok:
-                        return True
-                    # Node responded but is not the leader (or timed out
-                    # waiting for quorum) — clear URI to re-lookup next round.
-                    self._leader_uri = None
-            except Exception:
-                self._leader_uri = None
-
-        return False
+        uri = self._find_leader()
+        if uri is None:
+            return False
+        try:
+            with Pyro5.api.Proxy(uri) as proxy:
+                return bool(proxy.submit_command(command))
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Interactive loop
