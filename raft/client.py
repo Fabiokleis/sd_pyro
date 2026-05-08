@@ -1,9 +1,14 @@
+import time
+
 import Pyro5.api
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
 from raft.config import LEADER_NAME, NAMESERVER_HOST, NAMESERVER_PORT
+
+_MAX_RETRIES = 3
+_RETRY_DELAY = 0.5  # seconds between retries after leader change
 
 
 class RaftClient:
@@ -36,17 +41,38 @@ class RaftClient:
     # ------------------------------------------------------------------
 
     def send_command(self, command: str) -> bool:
-        """Submit *command* to the leader and return True if committed."""
-        if self._leader_uri is None:
-            self._leader_uri = self._find_leader()
-        if self._leader_uri is None:
-            return False
-        try:
-            with Pyro5.api.Proxy(self._leader_uri) as proxy:
-                return bool(proxy.submit_command(command))
-        except Exception:
-            self._leader_uri = None  # force re-lookup on next call
-            return False
+        """Submit *command* to the leader and return True if committed.
+
+        Retries up to ``_MAX_RETRIES`` times to handle leader changes — on
+        each failure (connection error or node not leader) the cached leader
+        URI is cleared so the name server is re-queried on the next attempt.
+        """
+        for attempt in range(_MAX_RETRIES):
+            if attempt > 0:
+                self._console.print(
+                    f"[yellow]Leader may have changed, retrying"
+                    f" ({attempt}/{_MAX_RETRIES - 1})…[/yellow]"
+                )
+                time.sleep(_RETRY_DELAY)
+                self._leader_uri = None
+
+            if self._leader_uri is None:
+                self._leader_uri = self._find_leader()
+            if self._leader_uri is None:
+                continue
+
+            try:
+                with Pyro5.api.Proxy(self._leader_uri) as proxy:
+                    ok = bool(proxy.submit_command(command))
+                    if ok:
+                        return True
+                    # Node responded but is not the leader (or timed out
+                    # waiting for quorum) — clear URI to re-lookup next round.
+                    self._leader_uri = None
+            except Exception:
+                self._leader_uri = None
+
+        return False
 
     # ------------------------------------------------------------------
     # Interactive loop

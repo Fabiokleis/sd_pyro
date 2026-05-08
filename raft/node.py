@@ -1,6 +1,7 @@
 import concurrent.futures
 import logging
 import random
+import socket
 import threading
 from typing import cast
 
@@ -111,7 +112,26 @@ class RaftNode:
             got_reset = self._reset_event.wait(timeout=timeout)
             self._reset_event.clear()
             if not got_reset and not self._stop_event.is_set():
-                self._start_election()
+                if self._has_quorum():
+                    self._start_election()
+                else:
+                    self._logger.debug(
+                        "skipping election: not enough peers reachable"
+                    )
+
+    def _is_peer_reachable(self, peer: NodeConfig) -> bool:
+        try:
+            with socket.create_connection((peer.host, peer.port), timeout=0.05):
+                return True
+        except OSError:
+            return False
+
+    def _has_quorum(self) -> bool:
+        """True when enough peers are reachable to form a majority."""
+        majority = (len(self.peers) + 1) // 2 + 1
+        needed = majority - 1  # self counts as one vote
+        reachable = sum(1 for p in self.peers if self._is_peer_reachable(p))
+        return reachable >= needed
 
     # ------------------------------------------------------------------ #
     # Election                                                             #
@@ -185,6 +205,7 @@ class RaftNode:
                                 self.current_term = result["term"]
                                 self.role = NodeRole.FOLLOWER
                                 self.voted_for = None
+                                self._commit_condition.notify_all()
                         return False, True
                     granted = result["vote_granted"]
                     self._logger.debug(
@@ -313,6 +334,7 @@ class RaftNode:
                             self.current_term = result["term"]
                             self.role = NodeRole.FOLLOWER
                             self.voted_for = None
+                            self._commit_condition.notify_all()
                             return
                         if (
                             self.role != NodeRole.LEADER
@@ -356,6 +378,7 @@ class RaftNode:
                 self.current_term = req.term
                 self.role = NodeRole.FOLLOWER
                 self.voted_for = None
+                self._commit_condition.notify_all()
 
             my_last_log_index = len(self.log)
             my_last_log_term = self.log[-1].term if self.log else 0
@@ -400,6 +423,7 @@ class RaftNode:
                 self.current_term = req.term
                 self.role = NodeRole.FOLLOWER
                 self.voted_for = None
+                self._commit_condition.notify_all()
 
             self._reset_election_timer()
 

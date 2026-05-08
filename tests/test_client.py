@@ -66,12 +66,19 @@ class TestSendCommand:
     def test_returns_false_when_commit_fails(self) -> None:
         client = RaftClient()
         client._leader_uri = "PYRO:node1@localhost:9001"
-        with patch("Pyro5.api.Proxy", return_value=_make_proxy(False)):
+        with (
+            patch("Pyro5.api.Proxy", return_value=_make_proxy(False)),
+            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
+            patch("raft.client.time.sleep"),
+        ):
             assert client.send_command("set x 1") is False
 
     def test_returns_false_when_no_leader_found(self) -> None:
         client = RaftClient()
-        with patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")):
+        with (
+            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
+            patch("raft.client.time.sleep"),
+        ):
             assert client.send_command("set x 1") is False
 
     def test_looks_up_leader_when_uri_is_none(self) -> None:
@@ -89,10 +96,41 @@ class TestSendCommand:
         client._leader_uri = "PYRO:node1@localhost:9001"
         proxy = _make_proxy()
         proxy.__enter__.side_effect = Exception("connection refused")
-        with patch("Pyro5.api.Proxy", return_value=proxy):
+        with (
+            patch("Pyro5.api.Proxy", return_value=proxy),
+            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
+            patch("raft.client.time.sleep"),
+        ):
             result = client.send_command("set x 1")
         assert result is False
         assert client._leader_uri is None
+
+    def test_clears_leader_uri_when_node_not_leader(self) -> None:
+        """False return (not leader) must also clear the cached URI."""
+        client = RaftClient()
+        client._leader_uri = "PYRO:node1@localhost:9001"
+        with (
+            patch("Pyro5.api.Proxy", return_value=_make_proxy(False)),
+            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
+            patch("raft.client.time.sleep"),
+        ):
+            client.send_command("set x 1")
+        assert client._leader_uri is None
+
+    def test_retries_and_succeeds_after_leader_change(self) -> None:
+        """First attempt fails (not leader); second finds new leader."""
+        client = RaftClient()
+        client._leader_uri = "PYRO:node1@localhost:9001"
+        dead_proxy = _make_proxy(False)
+        new_proxy = _make_proxy(True)
+        ns = _make_ns("PYRO:node2@localhost:9002")
+        proxies = iter([dead_proxy, new_proxy])
+        with (
+            patch("Pyro5.api.Proxy", side_effect=lambda _uri: next(proxies)),
+            patch("Pyro5.api.locate_ns", return_value=ns),
+            patch("raft.client.time.sleep"),
+        ):
+            assert client.send_command("set x 1") is True
 
     def test_forwards_command_string_verbatim(self) -> None:
         client = RaftClient()
@@ -217,6 +255,8 @@ class TestRun:
         with (
             patch("raft.client.Prompt.ask", side_effect=["set x 1", "quit"]),
             patch("Pyro5.api.Proxy", return_value=proxy),
+            patch("Pyro5.api.locate_ns", side_effect=Exception("no ns")),
+            patch("raft.client.time.sleep"),
             patch.object(
                 client._console,
                 "print",
