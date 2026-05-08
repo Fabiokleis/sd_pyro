@@ -1,11 +1,18 @@
+import logging
 import sys
 import time
 
 from raft.config import NODES
 from raft.node import RaftNode
 
+_LOG_FORMAT = "%(asctime)s  %(name)-12s  %(levelname)-7s  %(message)s"
+
 
 def run(node_id: str) -> None:
+    logging.basicConfig(
+        level=logging.INFO, format=_LOG_FORMAT, datefmt="%H:%M:%S"
+    )
+
     cfg = next((n for n in NODES if n.node_id == node_id), None)
     if cfg is None:
         valid = ", ".join(n.node_id for n in NODES)

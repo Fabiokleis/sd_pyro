@@ -1,4 +1,5 @@
 import concurrent.futures
+import logging
 import random
 import threading
 from typing import cast
@@ -61,6 +62,8 @@ class RaftNode:
         self._stop_event = threading.Event()
         self._election_thread: threading.Thread | None = None
 
+        self._logger = logging.getLogger(f"raft.{config.node_id}")
+
     @property
     def node_id(self) -> str:
         return self.config.node_id
@@ -85,6 +88,7 @@ class RaftNode:
             name=f"election-{self.node_id}",
         )
         self._election_thread.start()
+        self._logger.info("started  uri=%s", self.config.uri)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -124,21 +128,48 @@ class RaftNode:
             last_log_index = len(self.log)
             last_log_term = self.log[-1].term if self.log else 0
 
-        peer_votes = self._gather_votes(term, last_log_index, last_log_term)
+        self._logger.info("term=%d  CANDIDATE  starting election", term)
+
+        peer_votes, responded = self._gather_votes(
+            term, last_log_index, last_log_term
+        )
         total_votes = 1 + peer_votes  # self-vote + peer votes
         majority = (len(self.peers) + 1) // 2 + 1
 
         with self._lock:
             if self.role == NodeRole.CANDIDATE and self.current_term == term:
                 if total_votes >= majority:
+                    self._logger.info(
+                        "term=%d  LEADER  won election (%d/%d votes)",
+                        term,
+                        total_votes,
+                        len(self.peers) + 1,
+                    )
                     self._become_leader()
+                elif responded == 0:
+                    # No peers reachable — suppress per-election spam
+                    self._logger.debug(
+                        "term=%d  no peers reachable, retrying", term
+                    )
+                    self.role = NodeRole.FOLLOWER
                 else:
+                    self._logger.info(
+                        "term=%d  FOLLOWER  lost election"
+                        " (%d/%d votes, need %d)",
+                        term,
+                        total_votes,
+                        len(self.peers) + 1,
+                        majority,
+                    )
                     self.role = NodeRole.FOLLOWER
 
     def _gather_votes(
         self, term: int, last_log_index: int, last_log_term: int
-    ) -> int:
-        def request_from(peer: NodeConfig) -> bool:
+    ) -> tuple[int, int]:
+        """Return ``(granted_votes, responded_peers)``."""
+
+        def request_from(peer: NodeConfig) -> tuple[bool, bool]:
+            """Return ``(vote_granted, peer_responded)``."""
             try:
                 with Pyro5.api.Proxy(peer.uri) as remote:
                     request: VoteRequestWire = {
@@ -154,13 +185,26 @@ class RaftNode:
                                 self.current_term = result["term"]
                                 self.role = NodeRole.FOLLOWER
                                 self.voted_for = None
-                        return False
-                    return result["vote_granted"]
-            except Exception:
-                return False
+                        return False, True
+                    granted = result["vote_granted"]
+                    self._logger.debug(
+                        "term=%d  vote %s  from %s",
+                        term,
+                        "GRANTED" if granted else "DENIED",
+                        peer.node_id,
+                    )
+                    return granted, True
+            except Exception as exc:
+                self._logger.debug(
+                    "term=%d  %s unreachable: %s", term, peer.node_id, exc
+                )
+                return False, False
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            return sum(executor.map(request_from, self.peers))
+            results = list(executor.map(request_from, self.peers))
+        granted = sum(1 for v, _ in results if v)
+        responded = sum(1 for _, r in results if r)
+        return granted, responded
 
     def _become_leader(self) -> None:
         """Must be called while holding self._lock."""
@@ -181,8 +225,11 @@ class RaftNode:
             ns.register(
                 LEADER_NAME, self.config.uri, safe=False
             )  # overwrite on re-election
-        except Exception:
-            pass
+            self._logger.info(
+                "registered as leader in nameserver: %s", self.config.uri
+            )
+        except Exception as exc:
+            self._logger.warning("failed to register as leader: %s", exc)
 
     def _advance_commit_index(self) -> None:
         """Commit entries replicated by a majority.
@@ -196,6 +243,12 @@ class RaftNode:
             count = 1 + sum(1 for m in self.match_index.values() if m >= n)
             if count >= majority:
                 self.commit_index = n
+                self._logger.info(
+                    "commit_index -> %d  (quorum %d/%d)",
+                    n,
+                    count,
+                    len(self.peers) + 1,
+                )
                 self._commit_condition.notify_all()
                 break
 
@@ -251,6 +304,12 @@ class RaftNode:
                     )
                     with self._lock:
                         if result["term"] > self.current_term:
+                            self._logger.info(
+                                "term=%d  FOLLOWER  higher term=%d from %s",
+                                self.current_term,
+                                result["term"],
+                                peer.node_id,
+                            )
                             self.current_term = result["term"]
                             self.role = NodeRole.FOLLOWER
                             self.voted_for = None
@@ -285,6 +344,12 @@ class RaftNode:
     def request_vote(self, req: VoteRequest) -> VoteReply:
         with self._lock:
             if req.term < self.current_term:
+                self._logger.debug(
+                    "vote DENIED  candidate=%s  stale term=%d (current=%d)",
+                    req.candidate_id,
+                    req.term,
+                    self.current_term,
+                )
                 return VoteReply(term=self.current_term, vote_granted=False)
 
             if req.term > self.current_term:
@@ -305,8 +370,20 @@ class RaftNode:
             if can_vote:
                 self.voted_for = req.candidate_id
                 self._reset_election_timer()
+                self._logger.info(
+                    "term=%d  vote GRANTED  candidate=%s",
+                    req.term,
+                    req.candidate_id,
+                )
                 return VoteReply(term=self.current_term, vote_granted=True)
 
+            self._logger.info(
+                "term=%d  vote DENIED  candidate=%s  voted_for=%s  log_ok=%s",
+                req.term,
+                req.candidate_id,
+                self.voted_for,
+                log_ok,
+            )
             return VoteReply(term=self.current_term, vote_granted=False)
 
     def append_entries(self, req: AppendEntries) -> AppendReply:
@@ -317,6 +394,9 @@ class RaftNode:
                 )
 
             if req.term > self.current_term or self.role == NodeRole.CANDIDATE:
+                self._logger.info(
+                    "term=%d  FOLLOWER  leader=%s", req.term, req.leader_id
+                )
                 self.current_term = req.term
                 self.role = NodeRole.FOLLOWER
                 self.voted_for = None
@@ -334,6 +414,15 @@ class RaftNode:
                         term=self.current_term, success=False, match_index=0
                     )
 
+            if req.entries:
+                self._logger.info(
+                    "AppendEntries  leader=%s  %d entr%s  prev_index=%d",
+                    req.leader_id,
+                    len(req.entries),
+                    "y" if len(req.entries) == 1 else "ies",
+                    req.prev_log_index,
+                )
+
             for i, entry in enumerate(req.entries):
                 log_idx = req.prev_log_index + i  # 0-based position in self.log
                 if log_idx < len(self.log):
@@ -348,7 +437,10 @@ class RaftNode:
                     break
 
             if req.leader_commit > self.commit_index:
+                old = self.commit_index
                 self.commit_index = min(req.leader_commit, len(self.log))
+                if self.commit_index > old:
+                    self._logger.info("commit_index -> %d", self.commit_index)
 
             return AppendReply(
                 term=self.current_term, success=True, match_index=len(self.log)
@@ -364,6 +456,9 @@ class RaftNode:
                 command=command,
             )
             self.log.append(entry)
+            self._logger.info(
+                "submit_command  index=%d  %r", entry.index, command
+            )
             target = entry.index
             self._commit_condition.wait_for(
                 lambda: (
@@ -371,7 +466,14 @@ class RaftNode:
                 ),
                 timeout=5.0,
             )
-            return self.commit_index >= target
+            ok = self.commit_index >= target
+            if ok:
+                self._logger.info("committed  index=%d  %r", target, command)
+            else:
+                self._logger.warning(
+                    "timeout or lost leadership  index=%d  %r", target, command
+                )
+            return ok
 
 
 @Pyro5.api.expose
