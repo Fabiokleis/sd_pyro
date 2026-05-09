@@ -9,7 +9,17 @@ class NodeConfig:
 
     @property
     def uri(self) -> str:
+        """URI used by other Raft nodes (request_vote, append_entries)."""
         return f"PYRO:{self.node_id}@{self.host}:{self.port}"
+
+    @property
+    def client_object_id(self) -> str:
+        return f"{self.node_id}-client"
+
+    @property
+    def client_uri(self) -> str:
+        """URI exposed to clients (submit_command only)."""
+        return f"PYRO:{self.client_object_id}@{self.host}:{self.port}"
 
 
 NODES: list[NodeConfig] = [

@@ -22,9 +22,6 @@ class TestRaftNodeInit:
     def test_initial_commit_index(self) -> None:
         assert self.node.commit_index == 0
 
-    def test_initial_last_applied(self) -> None:
-        assert self.node.last_applied == 0
-
     def test_node_id_property(self) -> None:
         assert self.node.node_id == "node1"
 

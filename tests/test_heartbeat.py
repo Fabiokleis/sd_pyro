@@ -1,4 +1,7 @@
+import logging
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from raft.config import NODES
 from raft.node import RaftNode
@@ -24,11 +27,6 @@ def heartbeat(
     )
 
 
-# --------------------------------------------------------------------------- #
-# append_entries — follower heartbeat handling                                 #
-# --------------------------------------------------------------------------- #
-
-
 class TestAppendEntriesHeartbeat:
     def test_rejects_stale_term(self) -> None:
         node = make_node()
@@ -42,6 +40,15 @@ class TestAppendEntriesHeartbeat:
         node.current_term = 1
         reply = node.append_entries(heartbeat(term=1))
         assert reply.success is True
+
+    def test_logs_heartbeat_without_entries(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = make_node()
+        node.current_term = 1
+        with caplog.at_level(logging.DEBUG, logger=f"raft.{node.node_id}"):
+            node.append_entries(heartbeat(term=1, leader_commit=2))
+        assert any("HEARTBEAT" in record.message for record in caplog.records)
 
     def test_steps_down_candidate_on_heartbeat(self) -> None:
         node = make_node()
@@ -78,7 +85,7 @@ class TestAppendEntriesHeartbeat:
         node.commit_index = 0
         node.current_term = 1
         node.append_entries(heartbeat(term=1, leader_commit=99))
-        assert node.commit_index == 1  # min(99, len(log)=1)
+        assert node.commit_index == 1
 
     def test_does_not_decrease_commit_index(self) -> None:
         node = make_node()
@@ -97,18 +104,19 @@ class TestAppendEntriesHeartbeat:
         assert node.current_term == 5
 
 
-# --------------------------------------------------------------------------- #
-# _send_heartbeat — leader broadcasting                                        #
-# --------------------------------------------------------------------------- #
-
-
 class TestSendHeartbeat:
-    def _mock_proxy(self, term: int = 1, success: bool = True) -> MagicMock:
+    def _mock_proxy(
+        self, term: int = 1, success: bool = True, match_index: int = 0
+    ) -> MagicMock:
         proxy = MagicMock()
         proxy.__enter__ = MagicMock(return_value=proxy)
         proxy.__exit__ = MagicMock(return_value=False)
         proxy.append_entries = MagicMock(
-            return_value={"term": term, "success": success, "match_index": 0}
+            return_value={
+                "term": term,
+                "success": success,
+                "match_index": match_index,
+            }
         )
         return proxy
 
@@ -116,10 +124,22 @@ class TestSendHeartbeat:
         node = make_node()
         node.role = NodeRole.LEADER
         node.current_term = 2
+        node.next_index = {"node2": 1, "node3": 1, "node4": 1}
         proxies = [self._mock_proxy() for _ in node.peers]
         with patch("Pyro5.api.Proxy", side_effect=proxies):
             node._send_heartbeat()
         assert all(p.append_entries.called for p in proxies)
+
+    def test_sends_empty_entries(self) -> None:
+        node = make_node()
+        node.role = NodeRole.LEADER
+        node.current_term = 1
+        node.next_index = {"node2": 1, "node3": 1, "node4": 1}
+        proxy = self._mock_proxy()
+        with patch("Pyro5.api.Proxy", return_value=proxy):
+            node._send_heartbeat()
+        call_args = proxy.append_entries.call_args[0][0]
+        assert call_args["entries"] == []
 
     def test_skips_if_not_leader(self) -> None:
         node = make_node()
@@ -132,16 +152,61 @@ class TestSendHeartbeat:
         node = make_node()
         node.role = NodeRole.LEADER
         node.current_term = 2
+        node.next_index = {"node2": 1, "node3": 1, "node4": 1}
         proxy = self._mock_proxy(term=10, success=False)
         with patch("Pyro5.api.Proxy", return_value=proxy):
             node._send_heartbeat()
         assert node.role == NodeRole.FOLLOWER
         assert node.current_term == 10
 
+    def test_triggers_catchup_when_follower_behind(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = make_node()
+        node.role = NodeRole.LEADER
+        node.current_term = 1
+        node.log = [LogEntry(term=1, index=1, command="x")]
+        node.next_index = {"node2": 2, "node3": 2, "node4": 2}
+        proxies = [self._mock_proxy(match_index=0) for _ in node.peers]
+        spawned: list[bool] = []
+        original = node._send_entries_to
+        node._send_entries_to = (  # type: ignore[method-assign]
+            lambda peer, term, catchup=False: spawned.append(catchup)
+        )
+        with (
+            caplog.at_level(logging.INFO, logger=f"raft.{node.node_id}"),
+            patch("Pyro5.api.Proxy", side_effect=proxies),
+        ):
+            node._send_heartbeat()
+        node._send_entries_to = original  # type: ignore[method-assign]
+        import time as _time
 
-# --------------------------------------------------------------------------- #
-# _heartbeat_loop — control flow                                               #
-# --------------------------------------------------------------------------- #
+        _time.sleep(0.05)
+        assert len(spawned) > 0
+        assert any(
+            "CATCH-UP NEXT" in record.message for record in caplog.records
+        )
+        assert node.next_index["node2"] == 1
+
+    def test_logs_catchup_completion(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = make_node()
+        node.role = NodeRole.LEADER
+        node.current_term = 1
+        node.log = [LogEntry(term=1, index=1, command="x")]
+        node.next_index = {"node2": 1, "node3": 1, "node4": 1}
+        node.match_index = {"node2": 0, "node3": 0, "node4": 0}
+        proxy = self._mock_proxy(match_index=1)
+        with (
+            caplog.at_level(logging.INFO, logger=f"raft.{node.node_id}"),
+            patch("Pyro5.api.Proxy", return_value=proxy),
+        ):
+            node._send_entries_to(node.peers[0], 1, catchup=True)
+        assert any(
+            "CATCH-UP DONE" in record.message for record in caplog.records
+        )
+        assert node.next_index["node2"] == 2
 
 
 class TestHeartbeatLoop:
@@ -160,7 +225,7 @@ class TestHeartbeatLoop:
         def fake_send() -> None:
             nonlocal send_count
             send_count += 1
-            node.role = NodeRole.FOLLOWER  # step down after first heartbeat
+            node.role = NodeRole.FOLLOWER
 
         with (
             patch.object(node, "_send_heartbeat", side_effect=fake_send),
@@ -181,7 +246,7 @@ class TestHeartbeatLoop:
         def fake_is_set() -> bool:
             nonlocal call_count
             call_count += 1
-            return call_count > 1  # first call False, then True
+            return call_count > 1
 
         with (
             patch.object(node, "_send_heartbeat"),

@@ -1,5 +1,8 @@
+import logging
 import threading
 import time
+
+import pytest
 
 from raft.config import NODES
 from raft.node import RaftNode
@@ -41,11 +44,6 @@ def make_leader(index: int = 0) -> RaftNode:
     return node
 
 
-# --------------------------------------------------------------------------- #
-# append_entries — log replication path                                        #
-# --------------------------------------------------------------------------- #
-
-
 class TestAppendEntriesWithEntries:
     def test_appends_single_entry(self) -> None:
         node = make_node()
@@ -74,7 +72,6 @@ class TestAppendEntriesWithEntries:
     def test_rejects_missing_prev_entry(self) -> None:
         node = make_node()
         node.current_term = 1
-        # prev_log_index=2 but log is empty
         reply = node.append_entries(
             ae(term=1, prev_log_index=2, prev_log_term=1, entries=[entry(1, 3)])
         )
@@ -84,18 +81,16 @@ class TestAppendEntriesWithEntries:
         node = make_node()
         node.current_term = 2
         node.log = [entry(1, 1)]
-        # log[0].term=1 but prev_log_term=2
         reply = node.append_entries(
             ae(term=2, prev_log_index=1, prev_log_term=2, entries=[entry(2, 2)])
         )
         assert reply.success is False
-        assert len(node.log) == 1  # log unchanged
+        assert len(node.log) == 1
 
     def test_truncates_conflicting_entries(self) -> None:
         node = make_node()
         node.current_term = 2
-        node.log = [entry(1, 1), entry(1, 2)]  # stale entries from old leader
-        # entry(2, 2) conflicts with entry(1, 2) at position 2
+        node.log = [entry(1, 1), entry(1, 2)]
         reply = node.append_entries(
             ae(term=2, prev_log_index=1, prev_log_term=1, entries=[entry(2, 2)])
         )
@@ -107,7 +102,6 @@ class TestAppendEntriesWithEntries:
         node = make_node()
         node.current_term = 1
         node.log = [entry(1, 1)]
-        # Re-send the same entry — idempotent
         node.append_entries(
             ae(term=1, prev_log_index=0, prev_log_term=0, entries=[entry(1, 1)])
         )
@@ -142,7 +136,6 @@ class TestAppendEntriesWithEntries:
         assert node.commit_index == 1
 
     def test_appends_at_correct_offset(self) -> None:
-        """Append at prev_log_index=1 positions entry at log[1]."""
         node = make_node()
         node.current_term = 1
         node.log = [entry(1, 1)]
@@ -153,94 +146,44 @@ class TestAppendEntriesWithEntries:
         assert len(node.log) == 2
         assert node.log[1] == entry(1, 2)
 
-
-# --------------------------------------------------------------------------- #
-# _advance_commit_index — majority-based commit                                #
-# --------------------------------------------------------------------------- #
-
-
-class TestAdvanceCommitIndex:
-    def test_commits_when_majority_match(self) -> None:
-        node = make_leader()
-        node.log = [entry(1, 1)]
-        with node._commit_condition:
-            node.match_index["node2"] = 1
-            node.match_index["node3"] = 1  # self + 2 peers = 3/4 = majority
-            node._advance_commit_index()
-        assert node.commit_index == 1
-
-    def test_does_not_commit_without_majority(self) -> None:
-        node = make_leader()
-        node.log = [entry(1, 1)]
-        with node._commit_condition:
-            node.match_index["node2"] = 1  # self + 1 = 2/4 < majority(3)
-            node._advance_commit_index()
-        assert node.commit_index == 0
-
-    def test_does_not_commit_old_term_entries(self) -> None:
-        # Raft safety: a leader may only commit entries from its own term
-        node = make_leader()
-        node.current_term = 2
-        node.log = [entry(1, 1)]  # entry is from term 1, not current_term=2
-        with node._commit_condition:
-            node.match_index["node2"] = 1
-            node.match_index["node3"] = 1
-            node._advance_commit_index()
-        assert node.commit_index == 0
-
-    def test_commits_highest_majority_index(self) -> None:
-        node = make_leader()
-        node.log = [entry(1, 1), entry(1, 2), entry(1, 3)]
-        with node._commit_condition:
-            node.match_index["node2"] = 3
-            node.match_index["node3"] = 3
-            node._advance_commit_index()
-        assert node.commit_index == 3
-
-    def test_notifies_waiting_threads(self) -> None:
-        node = make_leader()
-        node.log = [entry(1, 1)]
-        notified = threading.Event()
-
-        def waiter() -> None:
-            with node._commit_condition:
-                node._commit_condition.wait_for(
-                    lambda: node.commit_index >= 1, timeout=1.0
+    def test_logs_uncommitted_entries_when_received(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = make_node()
+        node.current_term = 1
+        with caplog.at_level(logging.INFO, logger=f"raft.{node.node_id}"):
+            node.append_entries(
+                ae(
+                    term=1,
+                    prev_log_index=0,
+                    prev_log_term=0,
+                    entries=[entry(1, 1)],
                 )
-                notified.set()
-
-        t = threading.Thread(target=waiter)
-        t.start()
-        time.sleep(0.05)
-
-        with node._commit_condition:
-            node.match_index["node2"] = 1
-            node.match_index["node3"] = 1
-            node._advance_commit_index()
-
-        t.join(timeout=1.0)
-        assert notified.is_set()
-
-
-# --------------------------------------------------------------------------- #
-# submit_command — leader appends + waits for commit                           #
-# --------------------------------------------------------------------------- #
+            )
+        assert any(
+            "APPENDED     follower" in record.message
+            for record in caplog.records
+        )
 
 
 class TestSubmitCommand:
+    def _patch_replicate(self, node: RaftNode) -> None:
+        node._replicate_to_all = lambda: None  # type: ignore[method-assign]
+
     def test_rejects_if_not_leader(self) -> None:
         node = make_node()
         assert node.submit_command("set x 1") is False
 
     def test_appends_entry_to_log(self) -> None:
         node = make_leader()
+        self._patch_replicate(node)
 
         def commit_later() -> None:
             time.sleep(0.05)
             with node._commit_condition:
                 node.match_index["node2"] = 1
                 node.match_index["node3"] = 1
-                node._advance_commit_index()
+                node._commit_condition.notify_all()
 
         threading.Thread(target=commit_later, daemon=True).start()
         node.submit_command("set x 1")
@@ -251,6 +194,7 @@ class TestSubmitCommand:
 
     def test_returns_true_when_committed(self) -> None:
         node = make_leader()
+        self._patch_replicate(node)
         result: list[bool] = []
 
         def do_submit() -> None:
@@ -263,13 +207,14 @@ class TestSubmitCommand:
         with node._commit_condition:
             node.match_index["node2"] = 1
             node.match_index["node3"] = 1
-            node._advance_commit_index()
+            node._commit_condition.notify_all()
 
         t.join(timeout=2.0)
         assert result == [True]
 
     def test_returns_false_if_leader_steps_down(self) -> None:
         node = make_leader()
+        self._patch_replicate(node)
         result: list[bool] = []
 
         def do_submit() -> None:
@@ -290,16 +235,34 @@ class TestSubmitCommand:
         node = make_leader()
         node.current_term = 3
         node.log = [entry(2, 1), entry(3, 2)]
+        self._patch_replicate(node)
 
         def commit_later() -> None:
             time.sleep(0.05)
             with node._commit_condition:
                 node.match_index["node2"] = 3
                 node.match_index["node3"] = 3
-                node._advance_commit_index()
+                node._commit_condition.notify_all()
 
         threading.Thread(target=commit_later, daemon=True).start()
         node.submit_command("set z 9")
 
         assert node.log[2].term == 3
         assert node.log[2].index == 3
+
+    def test_triggers_immediate_replication(self) -> None:
+        node = make_leader()
+        triggered: list[bool] = []
+        node._replicate_to_all = lambda: triggered.append(True)  # type: ignore[method-assign]
+
+        def commit_later() -> None:
+            time.sleep(0.05)
+            with node._commit_condition:
+                node.match_index["node2"] = 1
+                node.match_index["node3"] = 1
+                node._commit_condition.notify_all()
+
+        threading.Thread(target=commit_later, daemon=True).start()
+        node.submit_command("set x 1")
+
+        assert triggered == [True]
